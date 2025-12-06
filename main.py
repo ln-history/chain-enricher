@@ -12,7 +12,7 @@ from prometheus_client import start_http_server, Counter, Gauge, Histogram
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 POSTGRES_URI = os.getenv("POSTGRES_URI")
-BTC_RPC_URL = f"http://{os.getenv('BTC_RPC_USER')}:{os.getenv('BTC_RPC_PASSWORD')}@{os.getenv('BTC_RPC_HOST')}:{os.getenv('BTC_RPC_PORT')}"
+BTC_RPC_URL = f"http://{os.getenv('BITCOIN_RPCUSER')}:{os.getenv('BITCOIN_RPCPASSWORD')}@{os.getenv('BITCOIN_RPCHOST')}:{os.getenv('BITCOIN_RPCPORT')}"
 BATCH_SIZE = 50  # Number of channels to process per loop
 
 # --- LOGGING SETUP ---
