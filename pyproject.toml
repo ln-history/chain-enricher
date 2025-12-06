@@ -1,6 +1,6 @@
 [project]
 name = "chain-enricher"
-version = "0.0.0"
+version = "0.1.0"
 description = "Enriching ln-history-database with on-chain data about funding and closing transactions"
 authors = [
     { name = "Fabian Kraus", email = "fabian.felix.kraus@gmail.com" }
