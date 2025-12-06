@@ -1,0 +1,50 @@
+[project]
+name = "chain-enricher"
+version = "0.0.0"
+description = "Enriching ln-history-database with on-chain data about funding and closing transactions"
+authors = [
+    { name = "Fabian Kraus", email = "fabian.felix.kraus@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.7, <4.0"
+license = {text = "MIT"}
+keywords = ["lightning", "network", "bitcoin", "gossip", "ln", "postgres"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://ln-history.info"
+Repository = "https://github.com/ln-history/chain-enricher"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 120
+target-version = ["py39"]
+skip-string-normalization = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+fix = true
+[tool.ruff.lint]
+select = ["E", "F", "B", "I"]  # Enable common rules: pyflakes, pycodestyle, bugbear, isort
+ignore = ["E501"]  # Example: ignore line length if Black handles it
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unused_configs = true
+exclude = ["__pycache__"]
+
+[tool.mypy-requests]
+ignore_missing_imports = true
+
+[tool.isort]
+profile = "black"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_provider = "pep621"

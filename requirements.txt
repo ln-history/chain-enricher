@@ -1,0 +1,4 @@
+psycopg[binary]
+requests
+prometheus-client
+python-dotenv
