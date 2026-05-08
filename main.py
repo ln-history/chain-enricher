@@ -7,6 +7,7 @@ import socket
 import sys
 import signal
 import threading
+from typing import Optional, Tuple
 import requests
 import psycopg
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-POSTGRES_URI = os.getenv("POSTGRES_URI")
+POSTGRES_URI = os.getenv("POSTGRES_URI", "postgresql://user:secret@ln-history-database/lnhistory")
 
 # Bitcoin Core (For Funding Data)
 BTC_RPC_URL = f"http://{os.getenv('BITCOIN_RPCUSER')}:{os.getenv('BITCOIN_RPCPASSWORD')}@{os.getenv('BITCOIN_RPCHOST')}:{os.getenv('BITCOIN_RPCPORT')}"
@@ -22,8 +23,8 @@ BTC_RPC_URL = f"http://{os.getenv('BITCOIN_RPCUSER')}:{os.getenv('BITCOIN_RPCPAS
 # Fulcrum (For Closure Detection)
 FULCRUM_HOST = os.getenv("FULCRUM_HOST", "127.0.0.1")
 FULCRUM_PORT = int(os.getenv("FULCRUM_PORT", "50001"))
-
-BATCH_SIZE = 50
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))
+RPC_TIMEOUT_SECONDS = int(os.getenv("RPC_TIMEOUT_SECONDS", 60))
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -48,7 +49,7 @@ FULCRUM_LATENCY = Histogram('chain_fulcrum_latency_seconds', 'Fulcrum RPC latenc
 
 
 # --- HELPER FUNCTIONS ---
-def decode_scid(scid_int):
+def decode_scid(scid_int: int) -> Optional[Tuple[int, int, int]]:
     """Converts BigInt SCID to (Block, Tx, Out) for Funding Lookups"""
     if not scid_int: return None
     block = scid_int >> 40
@@ -56,7 +57,7 @@ def decode_scid(scid_int):
     out = scid_int & 0xFFFF
     return block, tx, out
 
-def get_p2wsh_scripthash(key1_hex: str, key2_hex: str) -> str:
+def get_p2wsh_scripthash(key1_hex: str, key2_hex: str) -> Optional[str]:
     """Derives the Electrum ScriptHash for a 2-of-2 Lightning Multisig"""
     try:
         pk_bytes = [bytes.fromhex(key1_hex), bytes.fromhex(key2_hex)]
@@ -90,7 +91,7 @@ def rpc_batch_request(method, params_list):
     
     with RPC_LATENCY.time():
         try:
-            response = requests.post(BTC_RPC_URL, json=payload, timeout=30)
+            response = requests.post(BTC_RPC_URL, json=payload, timeout=RPC_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -108,7 +109,7 @@ class FulcrumClient:
         with FULCRUM_LATENCY.time():
             try:
                 # Short timeout for connect, longer for data
-                s = socket.create_connection((self.host, self.port), timeout=5)
+                s = socket.create_connection((self.host, self.port), timeout=30)
                 payload = {"id": 1, "jsonrpc": "2.0", "method": method, "params": params}
                 s.sendall(json.dumps(payload).encode() + b'\n')
                 
@@ -157,7 +158,7 @@ def funding_worker():
                     WHERE (capacity_sat IS NULL OR funding_timestamp IS NULL)
                       AND scid IS NOT NULL
                     LIMIT {BATCH_SIZE}
-                """)
+                """) # type: ignore
                 rows = cur.fetchall()
             
             PENDING_FUNDING.set(len(rows))
@@ -172,6 +173,7 @@ def funding_worker():
 
             for gossip_id, scid_int in rows:
                 b, t, o = decode_scid(scid_int)
+                if not (b or t or o): continue 
                 channels.append((gossip_id, b, t, o))
                 block_heights.append(b)
 
@@ -190,6 +192,7 @@ def funding_worker():
 
             if not block_requests: continue
             blocks_resp = rpc_batch_request("getblock", block_requests)
+            if not blocks_resp: continue
 
             # C. Get Raw Transactions — skip failed blocks, track channel index
             tx_requests = []
@@ -208,6 +211,7 @@ def funding_worker():
 
             if not tx_requests: continue
             txs_resp = rpc_batch_request("getrawtransaction", tx_requests)
+            if not txs_resp: continue
 
             # 4. Update Database
             updates = 0
