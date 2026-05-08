@@ -7,6 +7,7 @@ import socket
 import sys
 import signal
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 import requests
 import psycopg
@@ -24,6 +25,7 @@ BTC_RPC_URL = f"http://{os.getenv('BITCOIN_RPCUSER')}:{os.getenv('BITCOIN_RPCPAS
 FULCRUM_HOST = os.getenv("FULCRUM_HOST", "127.0.0.1")
 FULCRUM_PORT = int(os.getenv("FULCRUM_PORT", "50001"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))
+FUNDING_WORKERS = int(os.getenv("FUNDING_WORKERS", str(BATCH_SIZE//5)))
 RPC_TIMEOUT_SECONDS = int(os.getenv("RPC_TIMEOUT_SECONDS", 60))
 
 # --- LOGGING ---
@@ -108,21 +110,15 @@ class FulcrumClient:
     def call(self, method, params):
         with FULCRUM_LATENCY.time():
             try:
-                # Short timeout for connect, longer for data
                 s = socket.create_connection((self.host, self.port), timeout=30)
                 payload = {"id": 1, "jsonrpc": "2.0", "method": method, "params": params}
                 s.sendall(json.dumps(payload).encode() + b'\n')
-                
-                # Fulcrum responses can be large (history), read until newline
-                # In strict JSON-RPC over TCP, usually newline delimited.
-                # A simple huge buffer read is often safer for simple clients.
                 data = b""
                 while True:
                     chunk = s.recv(4096)
                     if not chunk: break
                     data += chunk
-                    if b'\n' in chunk: break 
-
+                    if b'\n' in chunk: break
                 s.close()
                 resp = json.loads(data.decode())
                 if 'error' in resp: raise Exception(resp['error'])
@@ -132,16 +128,138 @@ class FulcrumClient:
                 return None
 
 
+# --- FUNDING HELPERS ---
+
+def _fetch_funding_data(args: tuple) -> Optional[Tuple[str, int, datetime]]:
+    """
+    Fetch funding capacity and timestamp for one channel via Fulcrum.
+    Called concurrently from funding_worker's fast path.
+    Returns (gossip_id, capacity_sat, funding_timestamp) or None on failure.
+    """
+    gid, out_idx, key1, key2 = args
+    scripthash = get_p2wsh_scripthash(key1, key2)
+    if not scripthash:
+        return None
+
+    fulcrum = FulcrumClient(FULCRUM_HOST, FULCRUM_PORT)
+
+    history = fulcrum.call('blockchain.scripthash.get_history', [scripthash])
+    if not history:
+        return None
+
+    # Earliest confirmed entry is the funding tx
+    history.sort(key=lambda x: x.get('height', 0))
+    funding_entry = history[0]
+    if funding_entry.get('height', 0) <= 0:
+        return None  # Unconfirmed — retry later
+
+    raw_tx = fulcrum.call('blockchain.transaction.get', [funding_entry['tx_hash'], True])
+    if not raw_tx:
+        return None
+
+    try:
+        capacity_sat = int(raw_tx['vout'][out_idx]['value'] * 100_000_000)
+        block_time = datetime.fromtimestamp(raw_tx['blocktime'], timezone.utc)
+        return gid, capacity_sat, block_time
+    except Exception as e:
+        logger.error(f"Parsing Error for {gid}: {e}")
+        return None
+
+
+def _enrich_via_btc_core(conn: psycopg.Connection, rows: list) -> int:
+    """
+    Enrich channels that lack bitcoin keys using the Bitcoin Core RPC chain.
+    Returns number of channels updated.
+    """
+    channels = []
+    block_heights = []
+    for gossip_id, scid_int in rows:
+        coords = decode_scid(scid_int)
+        if coords is None:
+            continue
+        b, t, o = coords
+        channels.append((gossip_id, b, t, o))
+        block_heights.append(b)
+
+    if not block_heights:
+        return 0
+
+    hashes_resp = rpc_batch_request("getblockhash", block_heights)
+    if not hashes_resp:
+        return 0
+
+    block_requests = []
+    block_channel_idx: list[int] = []
+    for j, r in enumerate(hashes_resp):
+        if 'result' in r:
+            block_requests.append([r['result'], 1])
+            block_channel_idx.append(j)
+
+    if not block_requests:
+        return 0
+
+    blocks_resp = rpc_batch_request("getblock", block_requests)
+    if not blocks_resp:
+        return 0
+
+    tx_requests = []
+    tx_channel_idx: list[int] = []
+    for k, block_res in enumerate(blocks_resp):
+        if block_res.get('error') or 'result' not in block_res:
+            continue
+        j = block_channel_idx[k]
+        _, _, tx_idx, _ = channels[j]
+        try:
+            txid = block_res['result']['tx'][tx_idx]
+            tx_requests.append([txid, True])
+            tx_channel_idx.append(j)
+        except (IndexError, KeyError):
+            logger.warning(f"Failed to find tx index {tx_idx} in block for {channels[j][0]}")
+
+    if not tx_requests:
+        return 0
+
+    txs_resp = rpc_batch_request("getrawtransaction", tx_requests)
+    if not txs_resp:
+        return 0
+
+    updates = 0
+    with conn.cursor() as cur:
+        for m, tx_res in enumerate(txs_resp):
+            if 'result' not in tx_res:
+                continue
+            j = tx_channel_idx[m]
+            gossip_id, _, _, out_idx = channels[j]
+            tx = tx_res['result']
+            try:
+                capacity_sat = int(tx['vout'][out_idx]['value'] * 100_000_000)
+                block_time = datetime.fromtimestamp(tx['blocktime'], timezone.utc)
+                cur.execute("""
+                    UPDATE channels
+                    SET funding_timestamp = %s, capacity_sat = %s
+                    WHERE gossip_id = %s
+                """, (block_time, capacity_sat, gossip_id))
+                updates += 1
+            except Exception as e:
+                logger.error(f"Parsing Error for {gossip_id}: {e}")
+    return updates
+
+
 # --- WORKER THREADS ---
 
 def funding_worker():
     """
     Worker 1: Funding Enrichment
-    Finds channels with missing capacity/timestamp and queries Bitcoin Core.
+
+    Fast path  — channels with bitcoin_key_1/2: derives the P2WSH scripthash and
+    queries Fulcrum directly, skipping the expensive getblock call entirely.
+    All channels in the batch are queried concurrently via a thread pool.
+
+    Slow path  — channels without keys: falls back to the Bitcoin Core RPC chain
+    (getblockhash → getblock → getrawtransaction).
     """
     logger.info("--- Funding Worker Started ---")
-    
-    # Independent DB connection for this thread
+
     try:
         conn = psycopg.connect(POSTGRES_URI, autocommit=True)
         logger.info("--- Connected to PostgreSQL ---")
@@ -151,91 +269,71 @@ def funding_worker():
 
     while True:
         try:
-            # 1. Check for work
+            did_work = False
+
+            # === FAST PATH: Fulcrum (channels with both bitcoin keys) ===
             with conn.cursor() as cur:
                 cur.execute(f"""
-                    SELECT gossip_id, scid FROM channels
+                    SELECT gossip_id, scid, bitcoin_key_1, bitcoin_key_2
+                    FROM channels
                     WHERE (capacity_sat IS NULL OR funding_timestamp IS NULL)
                       AND scid IS NOT NULL
+                      AND bitcoin_key_1 IS NOT NULL
+                      AND bitcoin_key_2 IS NOT NULL
                     LIMIT {BATCH_SIZE}
                 """) # type: ignore
-                rows = cur.fetchall()
-            
-            PENDING_FUNDING.set(len(rows))
+                fulcrum_rows = cur.fetchall()
 
-            if not rows:
-                time.sleep(5)
-                continue
+            if fulcrum_rows:
+                PENDING_FUNDING.set(len(fulcrum_rows))
+                args_list = []
+                for gid, scid_int, k1, k2 in fulcrum_rows:
+                    coords = decode_scid(scid_int)
+                    if coords is None:
+                        continue
+                    _, _, out_idx = coords
+                    args_list.append((gid, out_idx, k1, k2))
 
-            # 2. Prepare Data — sequential list keeps indices aligned across all RPC hops
-            channels = []  # (gossip_id, block, tx_idx, out_idx)
-            block_heights = []
+                with ThreadPoolExecutor(max_workers=FUNDING_WORKERS) as executor:
+                    results = list(executor.map(_fetch_funding_data, args_list))
 
-            for gossip_id, scid_int in rows:
-                b, t, o = decode_scid(scid_int)
-                if not (b or t or o): continue 
-                channels.append((gossip_id, b, t, o))
-                block_heights.append(b)
-
-            # 3. Execute RPC Chain
-            # A. Get Block Hashes — one response per channel, aligned by index
-            hashes_resp = rpc_batch_request("getblockhash", block_heights)
-            if not hashes_resp: continue
-
-            # B. Get Block Data — skip failed hashes but track which channel each request belongs to
-            block_requests = []
-            block_channel_idx = []  # maps block_requests[k] → channels[j]
-            for j, r in enumerate(hashes_resp):
-                if 'result' in r:
-                    block_requests.append([r['result'], 1])
-                    block_channel_idx.append(j)
-
-            if not block_requests: continue
-            blocks_resp = rpc_batch_request("getblock", block_requests)
-            if not blocks_resp: continue
-
-            # C. Get Raw Transactions — skip failed blocks, track channel index
-            tx_requests = []
-            tx_channel_idx = []  # maps tx_requests[k] → channels[j]
-
-            for k, block_res in enumerate(blocks_resp):
-                if block_res.get('error') or 'result' not in block_res: continue
-                j = block_channel_idx[k]
-                _, _, tx_idx, _ = channels[j]
-                try:
-                    txid = block_res['result']['tx'][tx_idx]
-                    tx_requests.append([txid, True])
-                    tx_channel_idx.append(j)
-                except (IndexError, KeyError):
-                    logger.warning(f"Failed to find tx index {tx_idx} in block for {channels[j][0]}")
-
-            if not tx_requests: continue
-            txs_resp = rpc_batch_request("getrawtransaction", tx_requests)
-            if not txs_resp: continue
-
-            # 4. Update Database
-            updates = 0
-            with conn.cursor() as cur:
-                for m, tx_res in enumerate(txs_resp):
-                    if 'result' not in tx_res: continue
-                    j = tx_channel_idx[m]
-                    gossip_id, _, _, out_idx = channels[j]
-                    tx = tx_res['result']
-                    try:
-                        amount_btc = tx['vout'][out_idx]['value']
-                        capacity_sat = int(amount_btc * 100_000_000)
-                        block_time = datetime.fromtimestamp(tx['blocktime'], timezone.utc)
+                updates = 0
+                with conn.cursor() as cur:
+                    for result in results:
+                        if result is None:
+                            continue
+                        gid, capacity_sat, block_time = result
                         cur.execute("""
                             UPDATE channels
                             SET funding_timestamp = %s, capacity_sat = %s
                             WHERE gossip_id = %s
-                        """, (block_time, capacity_sat, gossip_id))
+                        """, (block_time, capacity_sat, gid))
                         updates += 1
-                    except Exception as e:
-                        logger.error(f"Parsing Error for {gossip_id}: {e}")
 
-            logger.info(f"Enriched {updates} funding transactions")
-            ENRICHED_TOTAL.inc(updates)
+                logger.info(f"Enriched {updates}/{len(fulcrum_rows)} channels via Fulcrum")
+                ENRICHED_TOTAL.inc(updates)
+                did_work = True
+
+            # === SLOW PATH: Bitcoin Core (channels missing one or both keys) ===
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT gossip_id, scid
+                    FROM channels
+                    WHERE (capacity_sat IS NULL OR funding_timestamp IS NULL)
+                      AND scid IS NOT NULL
+                      AND (bitcoin_key_1 IS NULL OR bitcoin_key_2 IS NULL)
+                    LIMIT {BATCH_SIZE}
+                """) # type: ignore
+                btc_rows = cur.fetchall()
+
+            if btc_rows:
+                updates = _enrich_via_btc_core(conn, btc_rows)
+                logger.info(f"Enriched {updates}/{len(btc_rows)} channels via Bitcoin Core")
+                ENRICHED_TOTAL.inc(updates)
+                did_work = True
+
+            if not did_work:
+                time.sleep(5)
 
         except Exception as e:
             logger.error(f"Funding Loop Error: {e}")
