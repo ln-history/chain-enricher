@@ -152,7 +152,12 @@ def funding_worker():
         try:
             # 1. Check for work
             with conn.cursor() as cur:
-                cur.execute(f"SELECT gossip_id, scid FROM channels WHERE capacity_sat IS NULL LIMIT {BATCH_SIZE}")
+                cur.execute(f"""
+                    SELECT gossip_id, scid FROM channels
+                    WHERE (capacity_sat IS NULL OR funding_timestamp IS NULL)
+                      AND scid IS NOT NULL
+                    LIMIT {BATCH_SIZE}
+                """)
                 rows = cur.fetchall()
             
             PENDING_FUNDING.set(len(rows))
@@ -161,69 +166,64 @@ def funding_worker():
                 time.sleep(5)
                 continue
 
-            # 2. Prepare Data
-            scid_map = {} 
+            # 2. Prepare Data — sequential list keeps indices aligned across all RPC hops
+            channels = []  # (gossip_id, block, tx_idx, out_idx)
             block_heights = []
 
-            for i, (gossip_id, scid_int) in enumerate(rows):
-                if not scid_int: continue
+            for gossip_id, scid_int in rows:
                 b, t, o = decode_scid(scid_int)
-                scid_map[i] = (gossip_id, b, t, o)
+                channels.append((gossip_id, b, t, o))
                 block_heights.append(b)
 
-            if not block_heights: continue
-
             # 3. Execute RPC Chain
-            # A. Get Block Hashes
+            # A. Get Block Hashes — one response per channel, aligned by index
             hashes_resp = rpc_batch_request("getblockhash", block_heights)
             if not hashes_resp: continue
 
-            # B. Get Block Data (to find TXID)
-            block_hashes = [r['result'] for r in hashes_resp if 'result' in r]
-            blocks_resp = rpc_batch_request("getblock", [[h, 1] for h in block_hashes])
-            
-            # C. Get Raw Transactions
+            # B. Get Block Data — skip failed hashes but track which channel each request belongs to
+            block_requests = []
+            block_channel_idx = []  # maps block_requests[k] → channels[j]
+            for j, r in enumerate(hashes_resp):
+                if 'result' in r:
+                    block_requests.append([r['result'], 1])
+                    block_channel_idx.append(j)
+
+            if not block_requests: continue
+            blocks_resp = rpc_batch_request("getblock", block_requests)
+
+            # C. Get Raw Transactions — skip failed blocks, track channel index
             tx_requests = []
-            valid_indices = []
+            tx_channel_idx = []  # maps tx_requests[k] → channels[j]
 
-            for i, block_res in enumerate(blocks_resp):
-                if 'error' in block_res and block_res['error']: continue
-                
-                if i not in scid_map: continue # Should not happen if sync
-                _, _, tx_idx, _ = scid_map[i]
-                
+            for k, block_res in enumerate(blocks_resp):
+                if block_res.get('error') or 'result' not in block_res: continue
+                j = block_channel_idx[k]
+                _, _, tx_idx, _ = channels[j]
                 try:
-                    block = block_res['result']
-                    txid = block['tx'][tx_idx]
+                    txid = block_res['result']['tx'][tx_idx]
                     tx_requests.append([txid, True])
-                    valid_indices.append(i)
+                    tx_channel_idx.append(j)
                 except (IndexError, KeyError):
-                    logger.warning(f"Failed to find tx index {tx_idx} in block")
+                    logger.warning(f"Failed to find tx index {tx_idx} in block for {channels[j][0]}")
 
+            if not tx_requests: continue
             txs_resp = rpc_batch_request("getrawtransaction", tx_requests)
 
             # 4. Update Database
             updates = 0
             with conn.cursor() as cur:
-                for i, tx_res in enumerate(txs_resp):
+                for m, tx_res in enumerate(txs_resp):
                     if 'result' not in tx_res: continue
-                    
-                    original_idx = valid_indices[i]
-                    gossip_id, _, _, out_idx = scid_map[original_idx]
-                    
+                    j = tx_channel_idx[m]
+                    gossip_id, _, _, out_idx = channels[j]
                     tx = tx_res['result']
                     try:
-                        # Extract Capacity (BTC -> Sats)
                         amount_btc = tx['vout'][out_idx]['value']
                         capacity_sat = int(amount_btc * 100_000_000)
-                        
-                        # Extract Timestamp
                         block_time = datetime.fromtimestamp(tx['blocktime'], timezone.utc)
-
-                        # Update DB
                         cur.execute("""
-                            UPDATE channels 
-                            SET funding_timestamp = %s, capacity_sat = %s 
+                            UPDATE channels
+                            SET funding_timestamp = %s, capacity_sat = %s
                             WHERE gossip_id = %s
                         """, (block_time, capacity_sat, gossip_id))
                         updates += 1
