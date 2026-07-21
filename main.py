@@ -46,6 +46,7 @@ RPC_ERRORS = Counter('chain_rpc_errors_total', 'Total failures calling Bitcoin R
 # Closure Metrics
 CLOSURE_CHECK_TOTAL = Counter('chain_closure_checks_total', 'Total closure checks performed')
 CLOSURES_DETECTED = Counter('chain_closures_detected_total', 'Total closed channels found', ['type'])
+UPDATES_CLOSED = Counter('chain_channel_updates_closed_total', 'Channel updates whose valid_to was closed off by a channel closure')
 OPEN_CHANNELS_GAUGE = Gauge('lightning_open_channels_count', 'Currently open channels in DB')
 FULCRUM_LATENCY = Histogram('chain_fulcrum_latency_seconds', 'Fulcrum RPC latency')
 
@@ -368,10 +369,10 @@ def closure_worker():
                 # Fetch Random Batch of OPEN channels that have KEYS and CAPACITY
                 # (Capacity needed for fee calc, Keys needed for script derivation)
                 cur.execute("""
-                    SELECT gossip_id, bitcoin_key_1, bitcoin_key_2, capacity_sat 
-                    FROM channels 
-                    WHERE closing_timestamp IS NULL 
-                      AND bitcoin_key_1 IS NOT NULL 
+                    SELECT gossip_id, scid, bitcoin_key_1, bitcoin_key_2, capacity_sat
+                    FROM channels
+                    WHERE closing_timestamp IS NULL
+                      AND bitcoin_key_1 IS NOT NULL
                       AND bitcoin_key_2 IS NOT NULL
                       AND capacity_sat IS NOT NULL
                     ORDER BY RANDOM() LIMIT 20
@@ -382,7 +383,7 @@ def closure_worker():
                 time.sleep(10)
                 continue
 
-            for gid, k1, k2, capacity_sat in rows:
+            for gid, scid, k1, k2, capacity_sat in rows:
                 # Derive P2WSH Address (ScriptHash)
                 scripthash = get_p2wsh_scripthash(k1, k2)
                 if not scripthash: continue
@@ -466,7 +467,11 @@ def closure_worker():
                     # To detect breach, we'd need to watch if this output gets swept by a justice key.
 
                 # --- DB UPDATE ---
-                with conn.cursor() as cur:
+                # One transaction: the connection is autocommit, so without this the
+                # three writes could tear. A crash after step 1 would leave the channel
+                # closed but its updates active, and the worker only ever scans
+                # closing_timestamp IS NULL — it would never come back to fix it.
+                with conn.transaction(), conn.cursor() as cur:
                     # 1. Mark Channel as Closed
                     cur.execute("""
                         UPDATE channels SET closing_timestamp = %s 
@@ -484,11 +489,26 @@ def closure_worker():
                     """, (
                         gid, closing_txid, closing_height, close_ts, closure_type,
                         total_out_sat, mining_fee,
-                        bal_1, bal_2, bal_1, bal_2 
+                        bal_1, bal_2, bal_1, bal_2
                     ))
 
-                logger.info(f"CLOSED: {gid} | Type: {closure_type} | Fee: {mining_fee} sat")
+                    # 3. Close off the still-active channel_update heads.
+                    # A closed channel can have no live gossip, so the head of each
+                    # (scid, direction) chain must stop being valid at the close.
+                    # GREATEST guards against zombie gossip — updates that arrived
+                    # after the close would otherwise get valid_to < valid_from.
+                    updates_closed = 0
+                    if scid is not None:
+                        cur.execute("""
+                            UPDATE channel_updates
+                            SET valid_to = GREATEST(%s, valid_from)
+                            WHERE scid = %s AND valid_to IS NULL
+                        """, (close_ts, scid))
+                        updates_closed = cur.rowcount
+
+                logger.info(f"CLOSED: {gid} | Type: {closure_type} | Fee: {mining_fee} sat | Updates closed: {updates_closed}")
                 CLOSURES_DETECTED.labels(type=closure_type).inc()
+                UPDATES_CLOSED.inc(updates_closed)
                 
             CLOSURE_CHECK_TOTAL.inc(len(rows))
 
