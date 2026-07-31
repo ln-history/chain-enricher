@@ -42,6 +42,7 @@ ENRICHED_TOTAL = Counter('chain_enriched_channels_total', 'Total channels enrich
 PENDING_FUNDING = Gauge('chain_pending_funding', 'Number of channels waiting for funding data')
 RPC_LATENCY = Histogram('chain_rpc_latency_seconds', 'Time spent waiting for Bitcoin Core RPC')
 RPC_ERRORS = Counter('chain_rpc_errors_total', 'Total failures calling Bitcoin RPC')
+ANNOUNCEABLE_ENRICHED = Counter('chain_announceable_enriched_total', 'Total channels given an announceable_timestamp (block funding+5)')
 
 # Closure Metrics
 CLOSURE_CHECK_TOTAL = Counter('chain_closure_checks_total', 'Total closure checks performed')
@@ -246,6 +247,81 @@ def _enrich_via_btc_core(conn: psycopg.Connection, rows: list) -> int:
     return updates
 
 
+ANNOUNCEABLE_CONF_OFFSET = 5  # block (funding_height + 5) = 6th confirmation (BOLT 7 announceable)
+
+
+def _enrich_announceable(conn: psycopg.Connection) -> int:
+    """
+    Populate channels.announceable_timestamp = header time of block ((scid >> 40) + 5).
+
+    This is the block at which the funding tx reaches its 6th confirmation — the BOLT 7
+    "SHOULD have 6 confirmations before announcing" threshold, i.e. the earliest instant a
+    channel is announceable. Exists to measure channel_announcement propagation lag.
+
+    Purely scid-derived (NEVER from funding_timestamp, which is corrupt for a handful of
+    channels). Uses Bitcoin Core getblockhash -> getblockheader (header-only; never
+    getblock/getblockstats, which load the full block body and are ~100x slower). Independent
+    of funding/closure enrichment — a channel can get announceable_timestamp even while
+    capacity_sat/funding_timestamp are still NULL. Idempotent.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT gossip_id, scid
+            FROM channels
+            WHERE scid IS NOT NULL
+              AND announceable_timestamp IS NULL
+            LIMIT {BATCH_SIZE}
+        """) # type: ignore
+        rows = cur.fetchall()
+
+    if not rows:
+        return 0
+
+    heights: dict[int, list[str]] = {}  # target height -> gossip_ids needing it
+    for gid, scid_int in rows:
+        h = (scid_int >> 40) + ANNOUNCEABLE_CONF_OFFSET
+        heights.setdefault(h, []).append(gid)
+    ordered = sorted(heights)
+
+    # height -> block hash. JSON-RPC 2.0 batch responses are id-mapped, not order-guaranteed.
+    hash_resp = rpc_batch_request("getblockhash", ordered)
+    if not hash_resp:
+        return 0
+    hash_by_id = {r['id']: r.get('result') for r in hash_resp if isinstance(r, dict)}
+
+    hh: list[int] = []
+    header_reqs: list[list[str]] = []
+    for i, h in enumerate(ordered):
+        block_hash = hash_by_id.get(i)
+        if block_hash:  # None => block not mined yet; leave NULL, retried next loop
+            hh.append(h)
+            header_reqs.append([block_hash])
+    if not header_reqs:
+        return 0
+
+    # block hash -> header (contains 'time'); header-only, so no full block body is read.
+    hdr_resp = rpc_batch_request("getblockheader", header_reqs)
+    if not hdr_resp:
+        return 0
+    hdr_by_id = {r['id']: r.get('result') for r in hdr_resp if isinstance(r, dict)}
+
+    updates = 0
+    with conn.cursor() as cur:
+        for i, h in enumerate(hh):
+            res = hdr_by_id.get(i)
+            if not res or 'time' not in res:
+                continue
+            ts = datetime.fromtimestamp(res['time'], timezone.utc)
+            for gid in heights[h]:
+                cur.execute("""
+                    UPDATE channels
+                    SET announceable_timestamp = %s
+                    WHERE gossip_id = %s AND announceable_timestamp IS NULL
+                """, (ts, gid))
+                updates += cur.rowcount
+    return updates
+
+
 # --- WORKER THREADS ---
 
 def funding_worker():
@@ -331,6 +407,13 @@ def funding_worker():
                 updates = _enrich_via_btc_core(conn, btc_rows)
                 logger.info(f"Enriched {updates}/{len(btc_rows)} channels via Bitcoin Core")
                 ENRICHED_TOTAL.inc(updates)
+                did_work = True
+
+            # === ANNOUNCEABLE: timestamp of block (funding_height + 5), scid-derived ===
+            ann = _enrich_announceable(conn)
+            if ann:
+                logger.info(f"Set announceable_timestamp on {ann} channels")
+                ANNOUNCEABLE_ENRICHED.inc(ann)
                 did_work = True
 
             if not did_work:
