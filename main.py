@@ -41,6 +41,8 @@ logger = logging.getLogger("chain-enricher")
 ENRICHED_TOTAL = Counter('chain_enriched_channels_total', 'Total channels enriched with funding data')
 PENDING_FUNDING = Gauge('chain_pending_funding', 'Number of channels waiting for funding data')
 RPC_LATENCY = Histogram('chain_rpc_latency_seconds', 'Time spent waiting for Bitcoin Core RPC')
+CLOSURE_REJECTED = Counter('chain_closure_rejected_total',
+                           'Closure candidates refused by a sanity check', ['reason'])
 RPC_ERRORS = Counter('chain_rpc_errors_total', 'Total failures calling Bitcoin RPC')
 ANNOUNCEABLE_ENRICHED = Counter('chain_announceable_enriched_total', 'Total channels given an announceable_timestamp (block funding+5)')
 
@@ -474,23 +476,44 @@ def closure_worker():
                 # Query Fulcrum History
                 history = fulcrum.call('blockchain.scripthash.get_history', [scripthash])
                 
-                # Logic: A channel usually has 1 tx (Funding). If 2+, it's closed (or spliced).
-                if not history or len(history) < 2:
-                    continue 
+                if not history:
+                    continue
 
-                # Channel is CLOSED. Find the spending transaction.
-                # Sort by height to find the latest event.
-                history.sort(key=lambda x: x['height'])
-                
-                # The last event is likely the closure
-                closing_event = history[-1]
+                # Pick the close by height RELATIVE TO FUNDING, never by list order.
+                #
+                # Electrum reports an unconfirmed tx with height 0 (-1 when it has
+                # unconfirmed parents). Those sort BELOW every confirmed height, so
+                # `history.sort(key=height)` followed by `history[-1]` returned the
+                # FUNDING transaction whenever the close was still in the mempool.
+                # That wrote the funding tx's txid/height/timestamp into 23,551 rows,
+                # with mining_fee_sat = 0 (capacity - funding_outputs is negative, and
+                # the max(0, ...) below clamps it) and closing_timestamp equal to
+                # funding_timestamp -- which makes the channel invisible to every
+                # point-in-time query. Found 2026-08-26, see TODO-closure-mempool-bug.md.
+                #
+                # Unconfirmed spends are deliberately ignored rather than processed: a
+                # mempool tx can still be replaced, and the channel simply stays in this
+                # worker's queue until its close confirms.
+                #
+                # Taking the EARLIEST confirmed event above the funding height (rather
+                # than the latest event overall) is also what makes this correct for
+                # spliced channels, whose history holds more than two entries.
+                funding_height = scid >> 40
+                confirmed = [e for e in history if e['height'] > funding_height]
+                if not confirmed:
+                    continue
+
+                closing_event = min(confirmed, key=lambda e: e['height'])
                 closing_txid = closing_event['tx_hash']
                 closing_height = closing_event['height']
 
-                if closing_height <= 0: 
-                    # Mempool transaction. Valid, but be careful with timestamps.
-                    # We can process it, or wait for confirm. Let's process.
-                    pass
+                # Cheap invariant, checked because it is free: a channel cannot close in
+                # or before the block that funded it.
+                if closing_height <= funding_height:
+                    CLOSURE_REJECTED.labels(reason='at_or_below_funding').inc()
+                    logger.error("scid %s: refusing closure at height %s <= funding height %s",
+                                 scid, closing_height, funding_height)
+                    continue
 
                 # Fetch Full Closing TX (Verbose)
                 raw_tx = fulcrum.call('blockchain.transaction.get', [closing_txid, True])
