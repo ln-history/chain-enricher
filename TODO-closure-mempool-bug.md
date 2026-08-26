@@ -166,3 +166,27 @@ CREATE TABLE repair_YYYYMMDD_closures AS
 3. Run the backfill batched, verify, then re-run the detector — it should return 0 plus
    any rows whose spends were unconfirmed at the time.
 4. Add the `mining_fee_sat = 0` rate and the detector count to monitoring.
+
+---
+
+## RESOLVED 2026-08-26
+
+Fixed in **0.6.1** and backfilled. Detector 23,551 → 6 (residual = spends still
+unconfirmed). See the ln-history-database skill for the full before/after table.
+
+**Correction to the plan above.** The backfill as scoped selected the close by *height*
+(earliest confirmed entry above the funding height). That mis-selected 36 of 23,573 rows
+(0.15%): an Electrum scripthash identifies a script, not an outpoint, so it can carry
+activity unrelated to this channel's funding output. The scope document's own first
+instinct — match the input spending `(funding_txid, scid & 0xFFFF)` — was correct and
+should have been used from the start. All 36 were found via
+`mining_fee_sat > capacity_sat * 0.05` and repaired by outpoint matching.
+
+**The live worker still uses height matching.** It is correct for the overwhelming
+majority and much cheaper (no per-candidate tx fetch), but it carries the same 0.15%
+failure mode. Consider adding outpoint verification for the selected candidate only —
+one extra `blockchain.transaction.get` per detected close, which the worker already does
+anyway to compute financials. That would make it exact at no extra RPC cost.
+
+**Still open:** `mining_fee = max(0, capacity_sat - sum(vout))` flags 31,293 of 442,062
+(7.1%) untouched closure rows as implausible. Separate bug, not investigated.
