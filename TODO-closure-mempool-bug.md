@@ -190,3 +190,18 @@ anyway to compute financials. That would make it exact at no extra RPC cost.
 
 **Still open:** `mining_fee = max(0, capacity_sat - sum(vout))` flags 31,293 of 442,062
 (7.1%) untouched closure rows as implausible. Separate bug, not investigated.
+
+## 0.6.2 — outpoint verification in the live worker (2026-08-26)
+
+The worker now verifies the candidate spends `(funding_txid, scid & 0xFFFF)` before
+accepting it, at no extra RPC cost. Two new `chain_closure_rejected_total` reasons:
+`no_funding_tx_at_height`, `no_tx_spends_funding_outpoint`.
+
+This mattered more than expected: before 0.6.2 the worker *re-closed* a channel whose
+bad closure row had just been deleted (`scid 761140222877237249`, funding output still
+unspent). Any repair of closure data must therefore ship the worker fix first.
+
+**The "7.1% bad fees" item is withdrawn** — it was a ratio-threshold artifact, not a bug;
+the fee formula is correct (200/200 verified on-chain). Real corruption is found with an
+absolute threshold: `mining_fee_sat > 1_000_000` gave 33 rows, 14 genuinely corrupt, all
+repaired. Fees ≥ 0.1 BTC: 9 → 0. `mining_fee_sat >= capacity_sat`: 1 → 0.

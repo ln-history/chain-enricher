@@ -44,6 +44,7 @@ RPC_LATENCY = Histogram('chain_rpc_latency_seconds', 'Time spent waiting for Bit
 CLOSURE_REJECTED = Counter('chain_closure_rejected_total',
                            'Closure candidates refused by a sanity check', ['reason'])
 RPC_ERRORS = Counter('chain_rpc_errors_total', 'Total failures calling Bitcoin RPC')
+DB_RECONNECTS = Counter('chain_db_reconnects_total', 'PostgreSQL reconnects', ['worker'])
 ANNOUNCEABLE_ENRICHED = Counter('chain_announceable_enriched_total', 'Total channels given an announceable_timestamp (block funding+5)')
 
 # Closure Metrics
@@ -424,7 +425,33 @@ def funding_worker():
         except Exception as e:
             logger.error(f"Funding Loop Error: {e}")
             RPC_ERRORS.inc()
+            conn = _live_conn(conn, "funding")
             time.sleep(5)
+
+
+def _live_conn(conn, who):
+    """Return a usable connection, re-establishing it if the old one died.
+
+    psycopg does NOT auto-reconnect, and both workers used to open a connection once
+    outside their loop. A single database restart therefore took enrichment down
+    permanently: on 2026-08-26 a planned restart left both workers logging
+    "the connection is closed" every 5 s for 36 hours, with 335 channels silently
+    stuck unenriched and nothing alerting, because the process stayed up and the
+    container stayed healthy.
+    """
+    try:
+        if conn is not None and not conn.closed:
+            return conn
+    except Exception:
+        pass
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:
+        pass
+    DB_RECONNECTS.labels(worker=who).inc()
+    logger.warning("%s: PostgreSQL connection lost, reconnecting", who)
+    return psycopg.connect(POSTGRES_URI, autocommit=True)
 
 
 def closure_worker():
@@ -654,6 +681,7 @@ def closure_worker():
 
         except Exception as e:
             logger.error(f"Closure Loop Error: {e}")
+            conn = _live_conn(conn, "closure")
             time.sleep(5)
 
 
