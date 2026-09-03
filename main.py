@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 import requests
 import psycopg
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 # --- CONFIGURATION ---
@@ -56,6 +57,18 @@ FULCRUM_LATENCY = Histogram('chain_fulcrum_latency_seconds', 'Fulcrum RPC latenc
 
 
 # --- HELPER FUNCTIONS ---
+def btc_to_sat(value) -> int:
+    """Convert a Bitcoin Core BTC amount to satoshis exactly.
+
+    Core reports amounts as JSON numbers, which Python parses as float, and
+    ``int(value * 100_000_000)`` then truncates on the wrong side of a binary rounding
+    error. Observed in production: a closing output of 105,539,536 sat was stored as
+    105,539,535. Going through Decimal on the *string* form keeps the decimal value the
+    node actually sent.
+    """
+    return int(Decimal(str(value)).scaleb(8).to_integral_value(rounding=ROUND_HALF_UP))
+
+
 def decode_scid(scid_int: int) -> Optional[Tuple[int, int, int]]:
     """Converts BigInt SCID to (Block, Tx, Out) for Funding Lookups"""
     if not scid_int: return None
@@ -135,11 +148,36 @@ class FulcrumClient:
 
 # --- FUNDING HELPERS ---
 
-def _fetch_funding_data(args: tuple) -> Optional[Tuple[str, int, datetime]]:
+def _funding_inputs(raw_tx: dict) -> list:
+    """(vin_index, prev_txid, prev_vout) for a funding transaction, in wire order.
+
+    Coinbase inputs have no prevout and are skipped; a channel cannot be funded by one.
     """
-    Fetch funding capacity and timestamp for one channel via Fulcrum.
+    out = []
+    for index, vin in enumerate(raw_tx.get('vin') or []):
+        prev_txid, prev_vout = vin.get('txid'), vin.get('vout')
+        if prev_txid is not None and prev_vout is not None:
+            out.append((index, prev_txid, int(prev_vout)))
+    return out
+
+
+def _write_funding_provenance(cur, gossip_id: str, txid: Optional[str], inputs: list) -> None:
+    """Persist the funding txid and its input outpoints."""
+    if txid:
+        cur.execute("UPDATE channels SET funding_txid = %s WHERE gossip_id = %s", (txid, gossip_id))
+    for vin_index, prev_txid, prev_vout in inputs:
+        cur.execute(
+            """INSERT INTO channel_funding_inputs (gossip_id, vin_index, prev_txid, prev_vout)
+               VALUES (%s, %s, %s, %s) ON CONFLICT (gossip_id, vin_index) DO NOTHING""",
+            (gossip_id, vin_index, prev_txid, prev_vout),
+        )
+
+
+def _fetch_funding_data(args: tuple) -> Optional[Tuple[str, int, datetime, Optional[str], list]]:
+    """
+    Fetch funding capacity, timestamp and provenance for one channel via Fulcrum.
     Called concurrently from funding_worker's fast path.
-    Returns (gossip_id, capacity_sat, funding_timestamp) or None on failure.
+    Returns (gossip_id, capacity_sat, funding_timestamp, funding_txid, inputs) or None.
     """
     gid, out_idx, key1, key2 = args
     scripthash = get_p2wsh_scripthash(key1, key2)
@@ -163,9 +201,11 @@ def _fetch_funding_data(args: tuple) -> Optional[Tuple[str, int, datetime]]:
         return None
 
     try:
-        capacity_sat = int(raw_tx['vout'][out_idx]['value'] * 100_000_000)
+        capacity_sat = btc_to_sat(raw_tx['vout'][out_idx]['value'])
         block_time = datetime.fromtimestamp(raw_tx['blocktime'], timezone.utc)
-        return gid, capacity_sat, block_time
+        # The funding inputs are the only on-chain evidence of who opened the channel:
+        # BOLT 7 orders node_id_1/node_id_2 lexicographically and never says who funded.
+        return gid, capacity_sat, block_time, raw_tx.get('txid'), _funding_inputs(raw_tx)
     except Exception as e:
         logger.error(f"Parsing Error for {gid}: {e}")
         return None
@@ -237,13 +277,14 @@ def _enrich_via_btc_core(conn: psycopg.Connection, rows: list) -> int:
             gossip_id, _, _, out_idx = channels[j]
             tx = tx_res['result']
             try:
-                capacity_sat = int(tx['vout'][out_idx]['value'] * 100_000_000)
+                capacity_sat = btc_to_sat(tx['vout'][out_idx]['value'])
                 block_time = datetime.fromtimestamp(tx['blocktime'], timezone.utc)
                 cur.execute("""
                     UPDATE channels
                     SET funding_timestamp = %s, capacity_sat = %s
                     WHERE gossip_id = %s
                 """, (block_time, capacity_sat, gossip_id))
+                _write_funding_provenance(cur, gossip_id, tx.get('txid'), _funding_inputs(tx))
                 updates += 1
             except Exception as e:
                 logger.error(f"Parsing Error for {gossip_id}: {e}")
@@ -382,12 +423,13 @@ def funding_worker():
                     for result in results:
                         if result is None:
                             continue
-                        gid, capacity_sat, block_time = result
+                        gid, capacity_sat, block_time, funding_txid, funding_inputs = result
                         cur.execute("""
                             UPDATE channels
                             SET funding_timestamp = %s, capacity_sat = %s
                             WHERE gossip_id = %s
                         """, (block_time, capacity_sat, gid))
+                        _write_funding_provenance(cur, gid, funding_txid, funding_inputs)
                         updates += 1
 
                 logger.info(f"Enriched {updates}/{len(fulcrum_rows)} channels via Fulcrum")
@@ -597,18 +639,22 @@ def closure_worker():
 
                 # 2. Financials
                 outputs = raw_tx.get('vout', [])
-                total_out_sat = sum(int(o['value'] * 100_000_000) for o in outputs)
-                
+                total_out_sat = sum(btc_to_sat(o['value']) for o in outputs)
+
                 # Fee = Input (Capacity) - Outputs
                 mining_fee = max(0, capacity_sat - total_out_sat)
-                
-                # Balance Distribution (Heuristic: Take 2 largest outputs)
-                # Ignore dust (< 546 sats) often used for anchors
+
+                # Largest and second-largest output, ignoring dust (<= 546 sat, typically
+                # anchors). These are what output_0_sat / output_1_sat and
+                # balance_node_1_sat / balance_node_2_sat have always held: they are NOT
+                # vout[0]/vout[1] and NOT attributed to node_1/node_2. Kept unchanged
+                # because the API selects those columns; the honest, ordered, script-
+                # bearing version goes to channel_closure_outputs below.
                 significant_outs = sorted(
-                    [int(o['value']*100_000_000) for o in outputs if o['value'] > 0.00000546],
+                    (btc_to_sat(o['value']) for o in outputs if btc_to_sat(o['value']) > 546),
                     reverse=True
                 )
-                
+
                 bal_1 = significant_outs[0] if len(significant_outs) > 0 else 0
                 bal_2 = significant_outs[1] if len(significant_outs) > 1 else 0
 
@@ -658,6 +704,24 @@ def closure_worker():
                         total_out_sat, mining_fee,
                         bal_1, bal_2, bal_1, bal_2
                     ))
+
+                    # 2b. Every output, in real vout order, with its script. Attributing a
+                    # closing balance to a node means matching an output to something that
+                    # node controls, which is impossible without the scriptPubKey --
+                    # and unrecoverable later without re-fetching the transaction.
+                    for vout in outputs:
+                        spk = vout.get('scriptPubKey') or {}
+                        addresses = spk.get('addresses') or ([spk['address']] if spk.get('address') else [])
+                        cur.execute("""
+                            INSERT INTO channel_closure_outputs
+                            (gossip_id, closing_txid, vout_index, value_sat,
+                             script_pubkey, script_type, address)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (gossip_id, vout_index) DO NOTHING
+                        """, (
+                            gid, closing_txid, int(vout.get('n', 0)), btc_to_sat(vout['value']),
+                            spk.get('hex'), spk.get('type'), addresses[0] if addresses else None,
+                        ))
 
                     # 3. Close off the still-active channel_update heads.
                     # A closed channel can have no live gossip, so the head of each
