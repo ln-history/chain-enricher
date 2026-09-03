@@ -191,14 +191,16 @@ def funding_inputs(tx: dict) -> List[Tuple[int, str, int]]:
     return inputs
 
 
-def pages(conn: psycopg.Connection) -> Iterable[List[Tuple[str, int, Optional[int]]]]:
+def pages(
+    conn: psycopg.Connection, start_scid: int = -1, stop_scid: Optional[int] = None
+) -> Iterable[List[Tuple[str, int, Optional[int]]]]:
     """Channels still missing a funding_txid, in scid order, paged by a moving cursor.
 
     The cursor is the scid rather than ``funding_txid IS NULL`` alone: a channel this run
     refuses to write (capacity mismatch, missing transaction) still has a NULL
     funding_txid, and re-selecting it would spin on the same rows forever.
     """
-    after = -1
+    after = start_scid
     while True:
         with conn.cursor() as cur:
             cur.execute(
@@ -206,10 +208,11 @@ def pages(conn: psycopg.Connection) -> Iterable[List[Tuple[str, int, Optional[in
                 SELECT gossip_id, scid, capacity_sat
                 FROM channels
                 WHERE funding_txid IS NULL AND scid IS NOT NULL AND scid > %s
+                  AND (%s::bigint IS NULL OR scid <= %s::bigint)
                 ORDER BY scid
                 LIMIT %s
                 """,
-                (after, PAGE),
+                (after, stop_scid, stop_scid, PAGE),
             )
             rows = cur.fetchall()
         if not rows:
@@ -222,6 +225,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill channel funding provenance")
     parser.add_argument("--apply", action="store_true", help="write; without it, resolve and report only")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many channels (0 = all)")
+    # Two processes over disjoint scid ranges finish sooner when Bitcoin Core has spare
+    # IO; they cannot collide, because the ranges do not overlap and each row is claimed
+    # by exactly one of them.
+    parser.add_argument("--start-scid", type=int, default=-1, help="resume above this scid")
+    parser.add_argument("--stop-scid", type=int, default=None, help="stop at this scid, inclusive")
     args = parser.parse_args()
 
     fulcrum = Fulcrum(FULCRUM_HOST, FULCRUM_PORT)
@@ -231,11 +239,15 @@ def main() -> int:
 
     with psycopg.connect(POSTGRES_URI) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM channels WHERE funding_txid IS NULL AND scid IS NOT NULL")
+            cur.execute(
+                """SELECT count(*) FROM channels WHERE funding_txid IS NULL AND scid IS NOT NULL
+                   AND scid > %s AND (%s::bigint IS NULL OR scid <= %s::bigint)""",
+                (args.start_scid, args.stop_scid, args.stop_scid),
+            )
             total = cur.fetchone()[0]
         print(f"{total:,} channels need funding provenance" + ("" if args.apply else "  (dry run)"))
 
-        for page in pages(conn):
+        for page in pages(conn, args.start_scid, args.stop_scid):
             positions = [decode_scid(scid) for _, scid, _ in page]
             txids = fulcrum.batch(
                 "blockchain.transaction.id_from_pos",

@@ -7,7 +7,8 @@ cd /home/bitcoin/ln-history-research
 M=/home/bitcoin/ln-history-research/chain-enricher/migrations
 URI="postgresql://admin:zDEaKsvyshZd3TSPWbmt774duMhqQuHXQpgvcWN9@ln-history-database:5432/lnhistory"
 
-while docker ps --filter name=funding-backfill --format '{{.Names}}' | grep -q funding-backfill; do sleep 60; done
+# the range-partitioned workers all match this prefix; wait for every one of them
+while docker ps --filter name=funding-backfill --format '{{.Names}}' | grep -q .; do sleep 60; done
 echo "$(date -Is) funding backfill finished; starting closure outputs" >> "$M/backfill.log"
 
 docker run --rm --name closure-backfill --network ln-history-network --env-file .env \
