@@ -1,6 +1,25 @@
 # chain-enricher: mempool spends corrupt 23,551 closure records
 
-**Found 2026-08-25/26, verified against Bitcoin Core and Fulcrum. Not yet fixed.**
+**Found 2026-08-25/26, verified against Bitcoin Core and Fulcrum.**
+
+**FIXED** in 96d9647 (`fix(closure): verify the candidate spends the funding outpoint`);
+the guard is in `closure_worker()` and rejects a candidate that does not spend
+`(funding_txid, scid & 0xFFFF)`.
+
+**Verified clean 2026-09-04**, using evidence that did not exist when this was written.
+`channels.funding_txid` is now backfilled from the scid for 499k channels, so the
+corruption has a signature that can be tested directly rather than sampled: a closure
+recording the funding transaction as the closing one has `closing_txid = funding_txid`.
+
+    closing_txid = funding_txid            3 of 468,185
+    closing_height = funding block         6 of 468,185
+    closing_height < funding block         0 of 468,185
+
+The residue is the handful of channels whose close is in the mempool right now, which is
+the intended steady state, not corruption. One of 93,437 links in the funding-flow
+attribution comes from such a row.
+
+Kept rather than deleted because the reasoning below is the reason the guard exists.
 
 ## The defect
 
