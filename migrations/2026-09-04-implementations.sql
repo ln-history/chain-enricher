@@ -121,7 +121,21 @@ or later, and the maximum over its advertised bits is a lower bound on its versi
 The same table supports elimination: a bit an implementation never advertises in any release
 is evidence the node is not running it.
 
-Seeded from a signal that needs no source archaeology -- see the inbound-fee row below.';
+Populated by scripts/extract_feature_bit_origins.py, which reads each implementation''s
+source at every release tag. Every one of them marks the node_announcement context
+explicitly, which is what makes this tractable: lnd''s SetNodeAnn, CLN''s
+NODE_ANNOUNCE_FEATURE, Eclair''s NodeFeature trait, LDK''s NodeContext.
+
+Tags are ordered by COMMIT DATE, not by parsing the version string. CLN carries a v0.0.1
+tag whose commit is from 2022-08-25; ordering by name put it first and dated every CLN bit
+to it, which is how OPT_ZEROCONF briefly came out as "introduced in v0.0.1".
+
+BITS DO NOT MEAN THE SAME THING TO EVERY IMPLEMENTATION. Bit 30 is option_amp to lnd and
+taproot to LDK; bit 50 is zeroconf everywhere except Eclair, where it is trampoline_payment;
+bit 40 is peer-backup-storage to CLN and zero-fee-commitments to Eclair. So the primary key
+is (implementation, bit) and a floor is only meaningful once the implementation is fixed.
+
+Also seeded with a signal that needs no source archaeology -- see the inbound-fee row.';
 
 -- lnd carries inbound fees in TLV record 55555 of channel_update, added in lnd 0.18.
 -- Verified against this archive on 2026-09-04 by cross-tabulating against the independent
@@ -159,5 +173,50 @@ view of each node.';
 
 GRANT SELECT ON feature_rulesets, feature_fingerprints, feature_bit_origins, node_implementations
     TO ai_reader, grafanareader, yannik;
+
+COMMIT;
+BEGIN;
+
+CREATE OR REPLACE VIEW node_version_floor AS
+WITH live AS (
+    SELECT ni.node_id, ni.implementation, na.features, na.valid_from, na.valid_to
+    FROM node_implementations ni
+    JOIN node_announcements na
+      ON na.node_id = ni.node_id AND na.valid_from = ni.valid_from
+),
+hit AS (
+    SELECT l.node_id, l.implementation, l.valid_from, l.valid_to, o.first_version, o.bit
+    FROM live l
+    JOIN feature_bit_origins o ON o.implementation = l.implementation
+    -- BOLT 9 numbers bit 0 as the least significant bit of the LAST byte, while
+    -- get_bit() numbers bytes left to right and bits LSB-first within each byte.
+    WHERE o.bit < length(l.features) * 8
+      AND get_bit(l.features, (length(l.features) - 1 - o.bit / 8) * 8 + (o.bit % 8)) = 1
+)
+SELECT DISTINCT ON (node_id, valid_from)
+       node_id, valid_from, valid_to, implementation,
+       first_version AS version_at_least,
+       bit           AS deciding_bit
+FROM hit
+ORDER BY node_id, valid_from, bit DESC;
+
+COMMENT ON VIEW node_version_floor IS
+'The earliest release of its own implementation that a node could be running, from the
+feature bits it advertises. A LOWER BOUND and never an equality: a bit exists in the source
+from some release onwards and never earlier, so advertising it proves the node is at least
+that new -- but a node can run a much later release and advertise nothing that says so,
+because what gets advertised depends on build flags and configuration.
+
+deciding_bit is the highest-numbered advertised bit, i.e. the one that sets the floor.
+Reading it alongside the version is worth the column: bits do NOT mean the same thing to
+every implementation -- bit 30 is option_amp to lnd and taproot to LDK, and bit 50 is
+zeroconf everywhere except Eclair, where it is trampoline_payment -- so a floor is only
+meaningful once the implementation is fixed, which is why this view joins through
+node_implementations rather than standing alone.
+
+This is the only version granularity available for lnd, which is ~85% of the network:
+impscan resolves CLN to v23.02/v24.02/v25.05 but has a single LND bucket.';
+
+GRANT SELECT ON node_version_floor TO ai_reader, grafanareader, yannik;
 
 COMMIT;
