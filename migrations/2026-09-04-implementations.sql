@@ -102,11 +102,20 @@ CREATE TABLE IF NOT EXISTS feature_bit_origins (
     implementation text    NOT NULL,
     bit            integer NOT NULL,
     first_version  text    NOT NULL,
+    first_released date,
     source         text    NOT NULL,
     verified_on    date    NOT NULL,
     notes          text,
     PRIMARY KEY (implementation, bit)
 );
+
+-- Added after the table shipped; harmless to re-run.
+ALTER TABLE feature_bit_origins ADD COLUMN IF NOT EXISTS first_released date;
+
+COMMENT ON COLUMN feature_bit_origins.first_released IS
+'Commit date of first_version. The version floor must rank by THIS, not by bit number: a
+later release can add a lower bit (lnd took route blinding, bit 24, in v0.18.0-beta having
+taken keysend, bit 54, in v0.15.0-beta), so ranking by bit would understate the floor.';
 
 COMMENT ON TABLE feature_bit_origins IS
 'The earliest release of an implementation that could advertise a given feature bit, read
@@ -185,20 +194,23 @@ WITH live AS (
       ON na.node_id = ni.node_id AND na.valid_from = ni.valid_from
 ),
 hit AS (
-    SELECT l.node_id, l.implementation, l.valid_from, l.valid_to, o.first_version, o.bit
+    SELECT l.node_id, l.implementation, l.valid_from, l.valid_to,
+           o.first_version, o.first_released, o.bit
     FROM live l
     JOIN feature_bit_origins o ON o.implementation = l.implementation
     -- BOLT 9 numbers bit 0 as the least significant bit of the LAST byte, while
     -- get_bit() numbers bytes left to right and bits LSB-first within each byte.
     WHERE o.bit < length(l.features) * 8
+      AND o.first_released IS NOT NULL
       AND get_bit(l.features, (length(l.features) - 1 - o.bit / 8) * 8 + (o.bit % 8)) = 1
 )
 SELECT DISTINCT ON (node_id, valid_from)
        node_id, valid_from, valid_to, implementation,
-       first_version AS version_at_least,
-       bit           AS deciding_bit
+       first_version  AS version_at_least,
+       first_released AS released_on,
+       bit            AS deciding_bit
 FROM hit
-ORDER BY node_id, valid_from, bit DESC;
+ORDER BY node_id, valid_from, first_released DESC, bit DESC;
 
 COMMENT ON VIEW node_version_floor IS
 'The earliest release of its own implementation that a node could be running, from the
@@ -207,7 +219,10 @@ from some release onwards and never earlier, so advertising it proves the node i
 that new -- but a node can run a much later release and advertise nothing that says so,
 because what gets advertised depends on build flags and configuration.
 
-deciding_bit is the highest-numbered advertised bit, i.e. the one that sets the floor.
+deciding_bit is the LATEST-RELEASED advertised bit, which is the one that sets the floor --
+not the highest-numbered one. A later release can add a lower bit: lnd took route blinding
+(bit 24) in v0.18.0-beta having taken keysend (bit 54) in v0.15.0-beta, so ranking by bit
+number understates the floor.
 Reading it alongside the version is worth the column: bits do NOT mean the same thing to
 every implementation -- bit 30 is option_amp to lnd and taproot to LDK, and bit 50 is
 zeroconf everywhere except Eclair, where it is trampoline_payment -- so a floor is only
